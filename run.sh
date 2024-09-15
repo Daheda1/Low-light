@@ -8,4 +8,4 @@
 #SBATCH --mem=60G
 #SBATCH --gres=gpu:1
 
-singularity exec --nv /ceph/containerpytorch_24.03-py3.sif python Train.py
+singularity exec --nv /ceph/container/pytorch_24.03-py3.sif python Train.py

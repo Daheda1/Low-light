@@ -4,9 +4,16 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
+import numpy as np
+from skimage.metrics import (
+    peak_signal_noise_ratio,
+    structural_similarity,
+    mean_squared_error,
+)
+from tqdm import tqdm
 
-# Custom Dataset for the LOL dataset
-class LOLDataset(Dataset):
+# Custom Dataset for the LOL dataset (Test Set)
+class LOLDatasetTest(Dataset):
     def __init__(self, low_light_dir, normal_light_dir, transform=None):
         self.low_light_dir = low_light_dir
         self.normal_light_dir = normal_light_dir
@@ -27,23 +34,22 @@ class LOLDataset(Dataset):
             low_light_image = self.transform(low_light_image)
             normal_light_image = self.transform(normal_light_image)
 
-        return low_light_image, normal_light_image
+        return low_light_image, normal_light_image, self.image_names[idx]
 
-# Example transformations
+# Example transformations (ensure consistency with training)
 transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.ToTensor(),
 ])
 
-# Directories where the images are stored
-low_light_dir = '/ceph/home/student.aau.dk/ov73uw/lol_dataset/our485/low'       # Low light path
-normal_light_dir = '/ceph/home/student.aau.dk/ov73uw/lol_dataset/our485/high'   # normal light path
+# Directories where the test images are stored
+test_low_light_dir = 'lol_dataset/eval15/low'       # Replace with your test low-light images path
+test_normal_light_dir = 'lol_dataset/eval15/high' # Replace with your test normal-light images path
 
-# Create dataset and dataloader
-dataset = LOLDataset(low_light_dir, normal_light_dir, transform=transform)
-dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+# Create test dataset and dataloader
+test_dataset = LOLDatasetTest(test_low_light_dir, test_normal_light_dir, transform=transform)
+test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-# Define the U-Net architecture
 class UNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=3):
         super(UNet, self).__init__()
@@ -112,48 +118,83 @@ class UNet(nn.Module):
         out = self.conv_last(dec9)
         return out
 
-# Initialize model, loss function, optimizer
+# Initialize model and load trained weights
 model = UNet()
-criterion = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+model.load_state_dict(torch.load('unet_low_light_enhancement_model.pth'))
 
 # Check if CUDA is available and use GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
+model.eval()
 
-# Training loop
-num_epochs = 20
+# Metrics initialization
+psnr_values = []
+ssim_values = []
+mse_values = []
+rmse_values = []
+mae_values = []
+image_names_list = []
 
-for epoch in range(num_epochs):
-    model.train()
-    running_loss = 0.0
-    for i, data in enumerate(dataloader):
-        low_light_images, normal_light_images = data
+# Evaluation loop
+with torch.no_grad():
+    for data in tqdm(test_dataloader, desc='Evaluating'):
+        low_light_images, normal_light_images, image_names = data
         low_light_images = low_light_images.to(device)
         normal_light_images = normal_light_images.to(device)
 
-        # Zero the parameter gradients
-        optimizer.zero_grad()
-
         # Forward pass
         outputs = model(low_light_images)
-        loss = criterion(outputs, normal_light_images)
 
-        # Backward pass and optimization
-        loss.backward()
-        optimizer.step()
+        # Move tensors to CPU and convert to numpy arrays
+        outputs_np = outputs.cpu().numpy().squeeze().transpose(1, 2, 0)
+        normal_images_np = normal_light_images.cpu().numpy().squeeze().transpose(1, 2, 0)
 
-        running_loss += loss.item()
+        # Ensure the pixel values are in [0,1]
+        outputs_np = np.clip(outputs_np, 0, 1)
+        normal_images_np = np.clip(normal_images_np, 0, 1)
 
-        # Print statistics every 10 batches
-        if i % 10 == 9:
-            print(f'[Epoch {epoch + 1}, Batch {i + 1}] loss: {running_loss / 10:.5f}')
-            running_loss = 0.0
+        # Compute MSE
+        mse = mean_squared_error(normal_images_np, outputs_np)
+        mse_values.append(mse)
 
-    # Save the model checkpoint after each epoch
-    torch.save(model.state_dict(), f'unet_model_epoch_{epoch+1}.pth')
+        # Compute RMSE
+        rmse = np.sqrt(mse)
+        rmse_values.append(rmse)
 
-print('Finished Training')
+        # Compute MAE
+        mae = np.mean(np.abs(outputs_np - normal_images_np))
+        mae_values.append(mae)
 
-# Save the final trained model
-torch.save(model.state_dict(), 'unet_low_light_enhancement_model.pth')
+        # Compute PSNR
+        psnr = peak_signal_noise_ratio(normal_images_np, outputs_np, data_range=1)
+        psnr_values.append(psnr)
+
+        # Compute SSIM
+        ssim = structural_similarity(normal_images_np, outputs_np, multichannel=True, data_range=1)
+        ssim_values.append(ssim)
+
+        image_names_list.append(image_names[0])
+
+# Compute average metrics
+avg_psnr = np.mean(psnr_values)
+avg_ssim = np.mean(ssim_values)
+avg_mse = np.mean(mse_values)
+avg_rmse = np.mean(rmse_values)
+avg_mae = np.mean(mae_values)
+
+# Save metrics to a txt file
+with open('evaluation_metrics.txt', 'w') as f:
+    f.write('Evaluation Metrics on Test Set\n')
+    f.write('-------------------------------\n')
+    f.write(f'Average PSNR: {avg_psnr:.4f} dB\n')
+    f.write(f'Average SSIM: {avg_ssim:.4f}\n')
+    f.write(f'Average MSE: {avg_mse:.6f}\n')
+    f.write(f'Average RMSE: {avg_rmse:.6f}\n')
+    f.write(f'Average MAE: {avg_mae:.6f}\n')
+
+    f.write('\nIndividual Image Metrics:\n')
+    f.write('Image Name\tPSNR(dB)\tSSIM\t\tMSE\t\tRMSE\t\tMAE\n')
+    for idx, image_name in enumerate(image_names_list):
+        f.write(f'{image_name}\t{psnr_values[idx]:.4f}\t\t{ssim_values[idx]:.4f}\t{mse_values[idx]:.6f}\t{rmse_values[idx]:.6f}\t{mae_values[idx]:.6f}\n')
+
+print('Evaluation complete. Metrics saved to evaluation_metrics.txt.')
