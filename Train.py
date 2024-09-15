@@ -1,9 +1,15 @@
 import os
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
+from torchvision import models
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 # Custom Dataset for the LOL dataset
 class LOLDataset(Dataset):
@@ -23,25 +29,54 @@ class LOLDataset(Dataset):
         low_light_image = Image.open(low_light_image_path).convert('RGB')
         normal_light_image = Image.open(normal_light_image_path).convert('RGB')
 
+        # Convert to numpy arrays
+        low_light_image = np.array(low_light_image)
+        normal_light_image = np.array(normal_light_image)
+
         if self.transform:
-            low_light_image = self.transform(low_light_image)
-            normal_light_image = self.transform(normal_light_image)
+            augmented = self.transform(image=low_light_image, image0=normal_light_image)
+            low_light_image = augmented['image']
+            normal_light_image = augmented['image0']
 
         return low_light_image, normal_light_image
 
-# Example transformations
-transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.ToTensor(),
-])
+# Define the transforms
+train_transforms = A.Compose([
+    A.Resize(256, 256),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2, p=0.5),
+    A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ToTensorV2(),
+], additional_targets={'image0': 'image'})
+
+val_transforms = A.Compose([
+    A.Resize(256, 256),
+    A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ToTensorV2(),
+], additional_targets={'image0': 'image'})
 
 # Directories where the images are stored
 low_light_dir = '/ceph/home/student.aau.dk/ov73uw/lol_dataset/our485/low'       # Low light path
 normal_light_dir = '/ceph/home/student.aau.dk/ov73uw/lol_dataset/our485/high'   # normal light path
 
-# Create dataset and dataloader
-dataset = LOLDataset(low_light_dir, normal_light_dir, transform=transform)
-dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+# Create dataset
+dataset = LOLDataset(low_light_dir, normal_light_dir, transform=train_transforms)
+
+# Split into training and validation sets
+dataset_size = len(dataset)
+train_size = int(0.8 * dataset_size)
+val_size = dataset_size - train_size
+
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+# For the validation dataset, override the transform
+val_dataset.dataset.transform = val_transforms
+
+# Create data loaders
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
 # Define the U-Net architecture
 class UNet(nn.Module):
@@ -112,22 +147,72 @@ class UNet(nn.Module):
         out = self.conv_last(dec9)
         return out
 
-# Initialize model, loss function, optimizer
+# Perceptual Loss using VGG19
+class PerceptualLoss(nn.Module):
+    def __init__(self, layers=[0, 5, 10, 19, 28], weights=None):
+        super(PerceptualLoss, self).__init__()
+        self.vgg = models.vgg19(pretrained=True).features[:max(layers)+1].eval()
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+        self.layers = layers
+        if weights is None:
+            self.weights = [1.0 / len(layers)] * len(layers)
+        else:
+            self.weights = weights
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+    def forward(self, input, target):
+        input = (input + 1) / 2  # Scale to [0,1]
+        target = (target + 1) / 2
+
+        input = (input - self.mean.to(input.device)) / self.std.to(input.device)
+        target = (target - self.mean.to(target.device)) / self.std.to(target.device)
+
+        input_features = []
+        target_features = []
+
+        x = input
+        y = target
+        for i in range(max(self.layers) + 1):
+            x = self.vgg[i](x)
+            y = self.vgg[i](y)
+            if i in self.layers:
+                input_features.append(x)
+                target_features.append(y)
+        loss = 0
+        for inp_f, tgt_f, w in zip(input_features, target_features, self.weights):
+            loss += w * nn.functional.l1_loss(inp_f, tgt_f)
+        return loss
+
+# Initialize model, loss functions, optimizer, scheduler
 model = UNet()
 criterion = nn.MSELoss()
+perceptual_criterion = PerceptualLoss()
+
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
 # Check if CUDA is available and use GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
+perceptual_criterion.to(device)
 
-# Training loop
-num_epochs = 20
+# Use DataParallel if multiple GPUs are available
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs")
+    model = nn.DataParallel(model)
+
+scaler = GradScaler()
+writer = SummaryWriter(log_dir='logs')
+
+num_epochs = 50
+best_val_loss = float('inf')
 
 for epoch in range(num_epochs):
     model.train()
     running_loss = 0.0
-    for i, data in enumerate(dataloader):
+    for i, data in enumerate(train_loader):
         low_light_images, normal_light_images = data
         low_light_images = low_light_images.to(device)
         normal_light_images = normal_light_images.to(device)
@@ -135,24 +220,58 @@ for epoch in range(num_epochs):
         # Zero the parameter gradients
         optimizer.zero_grad()
 
-        # Forward pass
-        outputs = model(low_light_images)
-        loss = criterion(outputs, normal_light_images)
+        with autocast():
+            # Forward pass
+            outputs = model(low_light_images)
+            mse_loss = criterion(outputs, normal_light_images)
+            perceptual_loss = perceptual_criterion(outputs, normal_light_images)
+            loss = mse_loss + 0.01 * perceptual_loss  # Weight the perceptual loss
 
         # Backward pass and optimization
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         running_loss += loss.item()
 
         # Print statistics every 10 batches
         if i % 10 == 9:
-            print(f'[Epoch {epoch + 1}, Batch {i + 1}] loss: {running_loss / 10:.5f}')
+            avg_loss = running_loss / 10
+            print(f'[Epoch {epoch + 1}, Batch {i + 1}] loss: {avg_loss:.5f}')
+            writer.add_scalar('Training Loss', avg_loss, epoch * len(train_loader) + i)
             running_loss = 0.0
 
-    # Save the model checkpoint after each epoch
-    torch.save(model.state_dict(), f'unet_model_epoch_{epoch+1}.pth')
+    # Validation loop
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for data in val_loader:
+            low_light_images, normal_light_images = data
+            low_light_images = low_light_images.to(device)
+            normal_light_images = normal_light_images.to(device)
 
+            with autocast():
+                outputs = model(low_light_images)
+                mse_loss = criterion(outputs, normal_light_images)
+                perceptual_loss = perceptual_criterion(outputs, normal_light_images)
+                loss = mse_loss + 0.01 * perceptual_loss
+
+            val_loss += loss.item()
+
+    val_loss /= len(val_loader)
+    print(f'Validation Loss after epoch {epoch + 1}: {val_loss:.5f}')
+    writer.add_scalar('Validation Loss', val_loss, epoch + 1)
+
+    # Save the best model
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), 'best_unet_model.pth')
+        print(f'Best model saved at epoch {epoch + 1}')
+
+    # Step the scheduler
+    scheduler.step()
+
+writer.close()
 print('Finished Training')
 
 # Save the final trained model

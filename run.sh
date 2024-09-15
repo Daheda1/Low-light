@@ -6,6 +6,6 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=15
 #SBATCH --mem=60G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:10
 
 singularity exec --nv /ceph/container/pytorch_24.03-py3.sif python Train.py
