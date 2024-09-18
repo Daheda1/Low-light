@@ -1,15 +1,13 @@
 import os
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
-import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
 from torchvision import models
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 
 # Custom Dataset for the LOL dataset
 class LOLDataset(Dataset):
@@ -29,56 +27,101 @@ class LOLDataset(Dataset):
         low_light_image = Image.open(low_light_image_path).convert('RGB')
         normal_light_image = Image.open(normal_light_image_path).convert('RGB')
 
-        # Convert to numpy arrays
-        low_light_image = np.array(low_light_image)
-        normal_light_image = np.array(normal_light_image)
-
         if self.transform:
-            augmented = self.transform(image=low_light_image, image0=normal_light_image)
-            low_light_image = augmented['image']
-            normal_light_image = augmented['image0']
+            low_light_image, normal_light_image = self.transform(low_light_image, normal_light_image)
 
         return low_light_image, normal_light_image
 
-# Define the transforms
-train_transforms = A.Compose([
-    A.Resize(256, 256),
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.RandomRotate90(p=0.5),
-    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2, p=0.5),
-    A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-    ToTensorV2(),
-], additional_targets={'image0': 'image'})
+# Define the custom joint transforms
+class JointTransform:
+    def __init__(self):
+        self.resize = transforms.Resize((256, 256))
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2
+        )
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
 
-val_transforms = A.Compose([
-    A.Resize(256, 256),
-    A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-    ToTensorV2(),
-], additional_targets={'image0': 'image'})
+    def __call__(self, img1, img2):
+        # Resize
+        img1 = self.resize(img1)
+        img2 = self.resize(img2)
 
-# Directories where the images are stored
-low_light_dir = '/ceph/home/student.aau.dk/ov73uw/lol_dataset/our485/low'       # Low light path
-normal_light_dir = '/ceph/home/student.aau.dk/ov73uw/lol_dataset/our485/high'   # normal light path
+        # Random horizontal flip
+        if random.random() < 0.5:
+            img1 = transforms.functional.hflip(img1)
+            img2 = transforms.functional.hflip(img2)
 
-# Create dataset
-dataset = LOLDataset(low_light_dir, normal_light_dir, transform=train_transforms)
+        # Random vertical flip
+        if random.random() < 0.5:
+            img1 = transforms.functional.vflip(img1)
+            img2 = transforms.functional.vflip(img2)
 
-# Split into training and validation sets
+        # Random rotate 90 degrees with probability 0.5
+        if random.random() < 0.5:
+            k = random.randint(1, 3)  # Rotate by 90, 180, or 270 degrees
+            img1 = transforms.functional.rotate(img1, 90 * k)
+            img2 = transforms.functional.rotate(img2, 90 * k)
+
+        # Random color jitter with probability 0.5
+        if random.random() < 0.5:
+            img1 = self.color_jitter(img1)
+            img2 = self.color_jitter(img2)
+
+        # Convert to tensor
+        img1 = self.to_tensor(img1)
+        img2 = self.to_tensor(img2)
+
+        # Normalize
+        img1 = self.normalize(img1)
+        img2 = self.normalize(img2)
+
+        return img1, img2
+
+# Define the validation transforms
+class ValTransform:
+    def __init__(self):
+        self.resize = transforms.Resize((256, 256))
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+
+    def __call__(self, img1, img2):
+        img1 = self.resize(img1)
+        img2 = self.resize(img2)
+
+        img1 = self.to_tensor(img1)
+        img2 = self.to_tensor(img2)
+
+        img1 = self.normalize(img1)
+        img2 = self.normalize(img2)
+
+        return img1, img2
+
+# Direktorier hvor billederne er gemt
+low_light_dir = '/ceph/home/student.aau.dk/ov73uw/lol_dataset/our485/low'       # Lavt lys sti
+normal_light_dir = '/ceph/home/student.aau.dk/ov73uw/lol_dataset/our485/high'   # Normalt lys sti
+
+# Opret dataset med træningstransformationer
+train_transform = JointTransform()
+val_transform = ValTransform()
+
+dataset = LOLDataset(low_light_dir, normal_light_dir, transform=train_transform)
+
+# Opdel i trænings- og valideringsdatasæt
 dataset_size = len(dataset)
 train_size = int(0.8 * dataset_size)
 val_size = dataset_size - train_size
 
 train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-# For the validation dataset, override the transform
-val_dataset.dataset.transform = val_transforms
+# For valideringsdatasættet, overskriv transformeringen
+val_dataset.dataset.transform = val_transform
 
-# Create data loaders
+# Opret data loaders
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
-# Define the U-Net architecture
+# Definer U-Net arkitekturen
 class UNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=3):
         super(UNet, self).__init__()
@@ -147,7 +190,7 @@ class UNet(nn.Module):
         out = self.conv_last(dec9)
         return out
 
-# Perceptual Loss using VGG19
+# Perceptual Loss ved brug af VGG19
 class PerceptualLoss(nn.Module):
     def __init__(self, layers=[0, 5, 10, 19, 28], weights=None):
         super(PerceptualLoss, self).__init__()
@@ -163,7 +206,7 @@ class PerceptualLoss(nn.Module):
         self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
     def forward(self, input, target):
-        input = (input + 1) / 2  # Scale to [0,1]
+        input = (input + 1) / 2  # Skaler til [0,1]
         target = (target + 1) / 2
 
         input = (input - self.mean.to(input.device)) / self.std.to(input.device)
@@ -185,7 +228,7 @@ class PerceptualLoss(nn.Module):
             loss += w * nn.functional.l1_loss(inp_f, tgt_f)
         return loss
 
-# Initialize model, loss functions, optimizer, scheduler
+# Initialiser model, loss funktioner, optimizer, scheduler
 model = UNet()
 criterion = nn.MSELoss()
 perceptual_criterion = PerceptualLoss()
@@ -193,12 +236,12 @@ perceptual_criterion = PerceptualLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
-# Check if CUDA is available and use GPU
+# Tjek om CUDA er tilgængelig og brug GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 perceptual_criterion.to(device)
 
-# Use DataParallel if multiple GPUs are available
+# Brug DataParallel hvis flere GPU'er er tilgængelige
 if torch.cuda.device_count() > 1:
     print(f"Using {torch.cuda.device_count()} GPUs")
     model = nn.DataParallel(model)
@@ -217,31 +260,31 @@ for epoch in range(num_epochs):
         low_light_images = low_light_images.to(device)
         normal_light_images = normal_light_images.to(device)
 
-        # Zero the parameter gradients
+        # Nulstil gradienter
         optimizer.zero_grad()
 
         with autocast():
-            # Forward pass
+            # Fremadpass
             outputs = model(low_light_images)
             mse_loss = criterion(outputs, normal_light_images)
             perceptual_loss = perceptual_criterion(outputs, normal_light_images)
-            loss = mse_loss + 0.01 * perceptual_loss  # Weight the perceptual loss
+            loss = mse_loss + 0.01 * perceptual_loss  # Vægtsæt perceptual loss
 
-        # Backward pass and optimization
+        # Tilbagepas og optimer
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
         running_loss += loss.item()
 
-        # Print statistics every 10 batches
+        # Print statistik hver 10. batch
         if i % 10 == 9:
             avg_loss = running_loss / 10
             print(f'[Epoch {epoch + 1}, Batch {i + 1}] loss: {avg_loss:.5f}')
             writer.add_scalar('Training Loss', avg_loss, epoch * len(train_loader) + i)
             running_loss = 0.0
 
-    # Validation loop
+    # Valideringsloop
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
@@ -262,17 +305,17 @@ for epoch in range(num_epochs):
     print(f'Validation Loss after epoch {epoch + 1}: {val_loss:.5f}')
     writer.add_scalar('Validation Loss', val_loss, epoch + 1)
 
-    # Save the best model
+    # Gem den bedste model
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         torch.save(model.state_dict(), 'best_unet_model.pth')
         print(f'Best model saved at epoch {epoch + 1}')
 
-    # Step the scheduler
+    # Opdater scheduler
     scheduler.step()
 
 writer.close()
 print('Finished Training')
 
-# Save the final trained model
+# Gem den endelige trænede model
 torch.save(model.state_dict(), 'unet_low_light_enhancement_model.pth')
